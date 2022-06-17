@@ -3,230 +3,238 @@ package gpt3
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
 
 const (
-	// APIURL is the base URL for the GPT-3 API.
-	APIURL = "https://api.openai.com/v1/engines/davinci/completions"
+	defaultBaseURL = "https://api.openai.com/v1/"
+	userAgent      = "gpt3-go"
 )
 
-// Client is a GPT-3 client.
+// A Client manages communication with the OpenAI API.
 type Client struct {
-	// APIKey is the API key for the GPT-3 API.
+	// HTTP client used to communicate with the API.
+	client *http.Client
+
+	// Base URL for API requests.
+	BaseURL *url.URL
+
+	// User agent used when communicating with the OpenAI API.
+	UserAgent string
+
+	// API key used when communicating with the OpenAI API.
 	APIKey string
 
-	// Logger is the logger to use.
-	Logger Logger
-
-	// HTTPClient is the HTTP client to use.
-	HTTPClient *http.Client
+	// Services used for communicating with the API
+	Completions *CompletionsService
 }
 
-// NewClient creates a new GPT-3 client.
+// NewClient returns a new OpenAI API client.
 func NewClient(apiKey string) *Client {
-	return &Client{
-		APIKey:     apiKey,
-		HTTPClient: &http.Client{Timeout: time.Second * 10},
-	}
+	baseURL, _ := url.Parse(defaultBaseURL)
+
+	c := &Client{client: http.DefaultClient, BaseURL: baseURL, UserAgent: userAgent, APIKey: apiKey}
+	c.Completions = &CompletionsService{client: c}
+	return c
 }
 
-// Completion is a GPT-3 completion.
-type Completion struct {
-	// ID is the completion ID.
-	ID string `json:"id"`
-
-	// Text is the completion text.
-	Text string `json:"text"`
-
-	// Timestamp is the completion timestamp.
-	Timestamp string `json:"timestamp"`
-
-	// Logprobs is the completion logprobs.
-	Logprobs []float64 `json:"logprobs"`
-
-	// Choices is the completion choices.
-	Choices []Choice `json:"choices"`
-}
-
-// Choice is a GPT-3 completion choice.
-type Choice struct {
-	// Text is the choice text.
-	Text string `json:"text"`
-
-	// Logprob is the choice logprob.
-	Logprob float64 `json:"logprob"`
-
-	// Timestamp is the choice timestamp.
-	Timestamp string `json:"timestamp"`
-}
-
-// Completions is a list of GPT-3 completions.
-type Completions struct {
-	// ID is the completion ID.
-	ID string `json:"id"`
-
-	// Completions is the list of completions.
-	Completions []Completion `json:"completions"`
-}
-
-// Complete completes a prompt.
-func (c *Client) Complete(prompt string, options ...Option) (*Completions, error) {
-	// Create the request.
-	req, err := c.createRequest(prompt, options...)
+// NewRequest creates an API request. A relative URL can be provided in urlStr,
+// in which case it is resolved relative to the BaseURL of the Client.
+// Relative URLs should always be specified without a preceding slash. If
+// specified, the value pointed to by body is JSON encoded and included as the
+// request body.
+func (c *Client) NewRequest(method, urlStr string, body interface{}) (*http.Request, error) {
+	rel, err := url.Parse(urlStr)
 	if err != nil {
 		return nil, err
 	}
 
-	// Send the request.
-	resp, err := c.HTTPClient.Do(req)
+	u := c.BaseURL.ResolveReference(rel)
+
+	var buf io.ReadWriter
+	if body != nil {
+		buf = new(bytes.Buffer)
+		err := json.NewEncoder(buf).Encode(body)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	req, err := http.NewRequest(method, u.String(), buf)
 	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", "application/json")
+	req.Header.Add("Authorization", fmt.Sprintf("Bearer %s", c.APIKey))
+	req.Header.Add("User-Agent", c.UserAgent)
+	return req, nil
+}
+
+// Do sends an API request and returns the API response. The API response is
+// JSON decoded and stored in the value pointed to by v, or returned as an
+// error if an API error has occurred. If v implements the io.Writer
+// interface, the raw response body will be written to v, without attempting to
+// first decode it.
+func (c *Client) Do(ctx context.Context, req *http.Request, v interface{}) (*http.Response, error) {
+	req = req.WithContext(ctx)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		// If we got an error, and the context has been canceled,
+		// the context's error is probably more useful.
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		// If the error type is *url.Error, sanitize its URL before returning.
+		if e, ok := err.(*url.Error); ok {
+			if url, err := url.Parse(e.URL); err == nil {
+				e.URL = sanitizeURL(url).String()
+				return nil, e
+			}
+		}
+
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	// Read the response.
-	body, err := ioutil.ReadAll(resp.Body)
+	err = CheckResponse(resp)
 	if err != nil {
-		return nil, err
+		// even though there was an error, we still return the response
+		// in case the caller wants to inspect it further
+		return resp, err
 	}
 
-	// Check the response status.
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	if v != nil {
+		if w, ok := v.(io.Writer); ok {
+			io.Copy(w, resp.Body)
+		} else {
+			err = json.NewDecoder(resp.Body).Decode(v)
+			if err == io.EOF {
+				err = nil // ignore EOF errors caused by empty response body
+			}
+		}
 	}
 
-	// Parse the response.
-	var completions Completions
-	if err := json.Unmarshal(body, &completions); err != nil {
-		return nil, err
+	return resp, err
+}
+
+// An ErrorResponse reports one or more errors caused by an API request.
+type ErrorResponse struct {
+	Response *http.Response // HTTP response that caused this error
+	Message  string         `json:"message"` // error message
+}
+
+func (r *ErrorResponse) Error() string {
+	return fmt.Sprintf("%v %v: %d %v",
+		r.Response.Request.Method, sanitizeURL(r.Response.Request.URL),
+		r.Response.StatusCode, r.Message)
+}
+
+// CheckResponse checks the API response for errors, and returns them if
+// present. A response is considered an error if it has a status code outside
+// the 200 range. API error responses are expected to have either no response
+// body, or a JSON response body that maps to ErrorResponse. Any other
+// response body will be silently ignored.
+func CheckResponse(r *http.Response) error {
+	if c := r.StatusCode; 200 <= c && c <= 299 {
+		return nil
 	}
-
-	return &completions, nil
-}
-
-// createRequest creates a request.
-func (c *Client) createRequest(prompt string, options ...Option) (*http.Request, error) {
-	// Create the request.
-	req, err := http.NewRequest(http.MethodPost, APIURL, nil)
-	if err != nil {
-		return nil, err
+	errorResponse := &ErrorResponse{Response: r}
+	data, err := ioutil.ReadAll(r.Body)
+	if err == nil && data != nil {
+		json.Unmarshal(data, errorResponse)
 	}
+	return errorResponse
+}
 
-	// Set the headers.
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.APIKey))
-
-	// Set the query parameters.
-	q := req.URL.Query()
-	q.Set("prompt", prompt)
-	for _, option := range options {
-		option(q)
+// sanitizeURL redacts the client_secret parameter from the URL which may be
+// exposed to the user.
+func sanitizeURL(uri *url.URL) *url.URL {
+	if uri == nil {
+		return nil
 	}
-	req.URL.RawQuery = q.Encode()
-
-	return req, nil
-}
-
-// Option is a GPT-3 option.
-type Option func(q url.Values)
-
-// MaxTokens sets the maximum number of tokens to generate.
-func MaxTokens(maxTokens int) Option {
-	return func(q url.Values) {
-		q.Set("max_tokens", fmt.Sprintf("%d", maxTokens))
+	params := uri.Query()
+	if len(params.Get("client_secret")) > 0 {
+		params.Set("client_secret", "REDACTED")
+		uri.RawQuery = params.Encode()
 	}
+	return uri
 }
 
-// Temperature sets the temperature.
-func Temperature(temperature float64) Option {
-	return func(q url.Values) {
-		q.Set("temperature", fmt.Sprintf("%f", temperature))
+// Bool is a helper routine that allocates a new bool value
+// to store v and returns a pointer to it.
+func Bool(v bool) *bool { return &v }
+
+// Int is a helper routine that allocates a new int32 value
+// to store v and returns a pointer to it, but unlike Int32
+// its argument value is an int.
+func Int(v int) *int { return &v }
+
+// String is a helper routine that allocates a new string value
+// to store v and returns a pointer to it.
+func String(v string) *string { return &v }
+
+// Float64 is a helper routine that allocates a new float64 value
+// to store v and returns a pointer to it.
+func Float64(v float64) *float64 { return &v }
+
+// Duration is a helper routine that allocates a new time.Duration value
+// to store v and returns a pointer to it.
+func Duration(v time.Duration) *time.Duration { return &v }
+
+// Getenv returns the value of the environment variable named by the key.
+// It returns the value, which will be empty if the variable is not present.
+// To distinguish between an empty value and an unset value, use LookupEnv.
+func Getenv(key string) string {
+	return os.Getenv(key)
+}
+
+// LookupEnv retrieves the value of the environment variable named
+// by the key. If the variable is present in the environment the
+// value (which may be empty) is returned and the boolean is true.
+// Otherwise the returned value will be empty and the boolean will
+// be false.
+func LookupEnv(key string) (string, bool) {
+	return os.LookupEnv(key)
+}
+
+// Setenv sets the value of the environment variable named by the key.
+// It returns an error, if any.
+func Setenv(key, value string) error {
+	return os.Setenv(key, value)
+}
+
+// Unsetenv unsets a single environment variable.
+func Unsetenv(key string) error {
+	return os.Unsetenv(key)
+}
+
+// ExpandEnv replaces ${var} or $var in the string according to the values
+// of the current environment variables. References to undefined variables
+// are replaced by the empty string.
+func ExpandEnv(s string) string {
+	return os.ExpandEnv(s)
+}
+
+// IsEnvTrue returns true if the environment variable is set to a value
+// that is considered true.
+func IsEnvTrue(key string) bool {
+	v, ok := LookupEnv(key)
+	if !ok {
+		return false
 	}
-}
-
-// TopP sets the top-p.
-func TopP(topP float64) Option {
-	return func(q url.Values) {
-		q.Set("top_p", fmt.Sprintf("%f", topP))
-	}
-}
-
-// N sets the number of completions to return.
-func N(n int) Option {
-	return func(q url.Values) {
-		q.Set("n", fmt.Sprintf("%d", n))
-	}
-}
-
-// Stream sets the stream.
-func Stream(stream bool) Option {
-	return func(q url.Values) {
-		q.Set("stream", fmt.Sprintf("%t", stream))
-	}
-}
-
-// Logprobs sets the logprobs.
-func Logprobs(logprobs bool) Option {
-	return func(q url.Values) {
-		q.Set("logprobs", fmt.Sprintf("%t", logprobs))
-	}
-}
-
-// Stop sets the stop.
-func Stop(stop string) Option {
-	return func(q url.Values) {
-		q.Set("stop", stop)
-	}
-}
-
-// Engine sets the engine.
-func Engine(engine string) Option {
-	return func(q url.Values) {
-		q.Set("engine", engine)
-	}
-}
-
-// EngineVersion sets the engine version.
-func EngineVersion(engineVersion string) Option {
-	return func(q url.Values) {
-		q.Set("engine_version", engineVersion)
-	}
-}
-
-// Presets sets the presets.
-func Presets(presets ...string) Option {
-	return func(q url.Values) {
-		q.Set("presets", strings.Join(presets, ","))
-	}
-}
-
-// Logger is a logger.
-type Logger interface {
-	Printf(format string, v ...interface{})
-}
-
-// LoggerFunc is a logger function.
-type LoggerFunc func(format string, v ...interface{})
-
-// Printf prints a message.
-func (f LoggerFunc) Printf(format string, v ...interface{}) {
-	f(format, v...)
-}
-
-// LoggerWriter is a logger writer.
-type LoggerWriter struct {
-	Logger Logger
-}
-
-// Write writes a message.
-func (w *LoggerWriter) Write(p []byte) (n int, err error) {
-	w.Logger.Printf("%s", bytes.TrimSpace(p))
-	return len(p), nil
+	return strings.EqualFold(v, "true") || strings.EqualFold(v, "yes") || strings.EqualFold(v, "1")
 }
