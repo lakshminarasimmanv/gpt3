@@ -14,7 +14,7 @@ import (
 
 const (
 	// APIURL is the base URL for the GPT-3 API.
-	APIURL = "https://api.openai.com/v1/completions"
+	APIURL = "https://api.openai.com/v1/engines/davinci/completions"
 )
 
 // Client is a GPT-3 client.
